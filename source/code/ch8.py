@@ -10,7 +10,9 @@ import pyrfume
 from collections import Counter
 import collections
 from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split
 from rdkit import Chem
+from abc import abstractmethod
 
 import time
 from tqdm import tqdm
@@ -103,11 +105,11 @@ def build_global_graph(vertex, edges, num_neighbors : int=25, is_undirectional :
     edges_idx, vertex_edge_loc = compute_vertex_edge_loc(vertex=vertex_idx.values(), edges=edges_idx)
 
     # 为每个节点构造邻居节点的索引，相连接的边的索引
-    # 邻居数小于 num_neighbors 的节点用 0 填充
+    # 邻居数小于 num_neighbors 的节点用 -1 填充
     # 邻居数大于 num_neighbors 的节点通过随机采样来截断
     # valid_len 保存每个节点的有效邻居数
-    neighbors_idx = [[0] * num_neighbors for _ in range(len(vertex))]
-    connected_edges_idx = [[0] * num_neighbors for _ in range(len(vertex))]
+    neighbors_idx = [[-1] * num_neighbors for _ in range(len(vertex))]
+    connected_edges_idx = [[-1] * num_neighbors for _ in range(len(vertex))]
     valid_lens = [0] * len(vertex)
 
     for i, (node_idx, (start, end)) in enumerate(vertex_edge_loc.items()):
@@ -142,21 +144,23 @@ def load_cora_nodetask_data(path : str, num_neighbors : int=25, is_undirectional
     # 构造图，并将所有信息转换为张量
     graph = {
         # 图上的特征
-        'vertex_feat': tf.constant(vertex_feat, dtype=tf.int32),
+        'vertex_feat': tf.constant(vertex_feat, dtype=tf.int32)[None,:],
         'edges_feat': None, # cora 数据集没有边的特征
         'graph_feat': None, # cora 数据集没有图的特征
         # 图的连接信息
         'vertex_idx': vertex_idx, # 节点名称到索引的映射
-        'edges_idx': tf.constant(edges_idx, dtype=tf.int32),
-        'neighbors_idx': tf.constant(neighbors_idx, dtype=tf.int32),
-        'connected_edges_idx': tf.constant(connected_edges_idx, dtype=tf.int32),
-        'valid_lens': tf.constant(valid_lens, dtype=tf.int32),
+        'edges_idx': tf.constant(edges_idx, dtype=tf.int32)[None,:],
+        'neighbors_idx': tf.constant(neighbors_idx, dtype=tf.int32)[None,:],
+        'connected_edges_idx': tf.constant(connected_edges_idx, dtype=tf.int32)[None,:],
+        'valid_lens': tf.constant(valid_lens, dtype=tf.int32)[None,:],
     }
     # 节点的标签
-    node_labels = tf.constant(vertex_class, dtype=tf.int32)
+    node_labels = tf.constant(vertex_class, dtype=tf.int32)[None,:] # 转换为张量，形状 (1, num_nodes)
 
     # 切分训练集和验证集节点
     train_nodes, valid_nodes = train_test_split(list(range(len(vertex))), test_size=test_size, random_state=42)
+    train_nodes = tf.constant(train_nodes, dtype=tf.int32)[None,:] # 转换为张量，形状 (1, num_train_nodes)
+    valid_nodes = tf.constant(valid_nodes, dtype=tf.int32)[None,:] # 转换为张量，形状 (1, num_valid_nodes)
 
     return graph, node_labels, train_nodes, valid_nodes, class_map
 
@@ -230,13 +234,16 @@ def node_subgraph_sampling(vertex, edges, vertex_feat, k_hops : int=1,
     return graphs
 
 class GraphDataLoader:
-    def __init__(self, graphs, batch_size : int=64, shuffle : bool=False, 
-                 num_node_feats : int=None, num_edge_feats : int=None, num_neighbors : int=None) -> None:
+    def __init__(self, graphs, labels=None, batch_size : int=64, shuffle : bool=False, 
+                 num_node_feats : int=None, num_edge_feats : int=None, num_neighbors : int=None,
+                 removed_keys : list=None) -> None:
         """
         Parameters
         ----------
         graphs : list
             存储子图信息的列表，每个元素为一个字典，字典中包含子图的信息
+        labels : list, default = None
+            图任务的标签，如果为 `None`，则表示无标签信息
         batch_size : int, default = 64
             批量大小
         shuffle : bool, default = False
@@ -247,12 +254,19 @@ class GraphDataLoader:
             边特征的维度，默认为 `None`，从图数据中自动获取
         num_neighbors : int, default = None
             每个节点的邻居数，默认为 `None`，从图数据中自动获取
+        removed_keys : list, default = None
+            在处理和构造图数据时，不需要考虑的图信息
         """
         self.graphs = graphs
+        self.labels = labels
         self.num_graphs = len(graphs)
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.graph_keys = graphs[0].keys()
+        # 移除不需要的图信息
+        self.graph_keys = list(graphs[0].keys())
+        if removed_keys is not None:
+            for key in removed_keys:
+                self.graph_keys.remove(key)
 
         # 准备填充的内容
         self.num_node_feats = len(graphs[0]["vertex_feat"][0]) if num_node_feats is None else num_node_feats
@@ -273,36 +287,53 @@ class GraphDataLoader:
             "vertex_feat": [0] * self.num_node_feats,
             "edges_feat": [0] * self.num_edge_feats,
             "edges_idx": (-1, -1),
-            "neighbors_idx": [0] * self.num_neighbors,
-            "connected_edges_idx": [0] * self.num_neighbors,
+            "neighbors_idx": [-1] * self.num_neighbors,
+            "connected_edges_idx": [-1] * self.num_neighbors,
             "valid_lens": 0
         }
     
     # 类的下标访问方法
     def __getitem__(self, idx):
-        return self.graphs[idx]
+        def add_batch_dim(graph):
+            for key in self.graph_keys:
+                graph[key] = tf.constant(graph[key], dtype=tf.float32)
+                graph[key] = tf.expand_dims(graph[key], axis=0)
+            return graph
+
+        # 将图信息转换为张量，并添加 batch 维度
+        graph = add_batch_dim(self.graphs[idx].copy())
+        if self.labels is not None:
+            return graph, self.labels[idx]
+        return graph
     
     # 类的 len 方法 
     def __len__(self):
         return self.num_graphs
     
+    # 类的迭代器方法
+    def __iter__(self):
+        return self.create_dataset(self.shuffle).__iter__()
+
     # 填充辅助函数，用变量 pad 填充列表 info，使其长度为 max_len
     def pad_info(self, info : list, pad, max_len : int):
         info += [pad for _ in range(max_len - len(info))]
         return info
     
-    def create_dataset(self):
+    def create_dataset(self, shuffle : bool=False):
         def padded_batch_generator():
             # 如果 shuffle 为 True，则打乱数据
-            idx = np.random.permutation(self.num_graphs) if self.shuffle else np.arange(self.num_graphs)
+            idx = np.random.permutation(self.num_graphs) if shuffle else np.arange(self.num_graphs)
 
             for i in range(0, self.num_graphs, self.batch_size):
                 # 选取 batch_size 个图
-                graph_batch = {}
+                graph_batch = {} # 存储当前 batch 中图的信息
                 for key in self.graph_keys:
                     # 这里用 copy() 是为了防止修改原始数据
                     graph_batch[key] = [self.graphs[j][key].copy() for j in idx[i:i+self.batch_size]]
                 
+                if self.labels is not None:
+                    labels_batch = [self.labels[j] for j in idx[i:i+self.batch_size]] # 存储当前 batch 中图的标签
+
                 # 进行填充
                 num_sub_nodes = max([len(x) for x in graph_batch["vertex_feat"]]) # 子图中最大节点数
                 num_sub_edges = max([len(x) for x in graph_batch["edges_feat"]]) # 子图中最大边数
@@ -329,20 +360,28 @@ class GraphDataLoader:
                 graph_batch["valid_nodes"] = tf.constant(valid_nodes)
                 graph_batch["valid_edges"] = tf.constant(valid_edges)
                 
-                yield graph_batch
+                if self.labels is not None:
+                    yield (graph_batch, tf.constant(labels_batch))
+                else:
+                    yield graph_batch
         
         # 创建 TensorFlow 数据集
-        dataset = tf.data.Dataset.from_generator(padded_batch_generator, 
-            output_signature={
-                "vertex_feat": tf.TensorSpec(shape=(None, None, self.num_node_feats), dtype=tf.float32),
-                "edges_feat": tf.TensorSpec(shape=(None, None, self.num_edge_feats), dtype=tf.float32),
+        # 创建 Signature 标注输出的数据格式
+        output_signature = {
+                "vertex_feat": tf.TensorSpec(shape=(None, None, self.num_node_feats)),
+                "edges_feat": tf.TensorSpec(shape=(None, None, self.num_edge_feats)),
                 "edges_idx": tf.TensorSpec(shape=(None, None, 2), dtype=tf.int32),
                 "neighbors_idx": tf.TensorSpec(shape=(None, None, self.num_neighbors), dtype=tf.int32),
                 "connected_edges_idx": tf.TensorSpec(shape=(None, None, self.num_neighbors), dtype=tf.int32),
                 "valid_lens": tf.TensorSpec(shape=(None, None), dtype=tf.int32),
                 "valid_nodes": tf.TensorSpec(shape=(None,), dtype=tf.int32),
                 "valid_edges": tf.TensorSpec(shape=(None,), dtype=tf.int32)
-            })
+        }
+        if self.labels is not None:
+            output_signature = (output_signature, tf.TensorSpec(shape=(None,)))
+
+        # 使用 from_generator 方法创建数据集
+        dataset = tf.data.Dataset.from_generator(padded_batch_generator, output_signature=output_signature)
         # prefetch 通过异步的方式让数据集准备好，提高效率
         dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
         return dataset
@@ -418,18 +457,15 @@ class GCNLayer(tf.keras.layers.Layer):
         # graph : 存储图信息的字典
         # 包含 vertex_feat, edges_feat, graph_feat, edges_idx, neighbors_idx, connections_idx, valid_lens
 
-        # 汇聚邻居节点特征，形状 (num_nodes, num_neighbors, num_features)
-        neighbors_feat = tf.gather(graph["vertex_feat"], graph["neighbors_idx"])
+        # 汇聚邻居节点特征，形状 (num_graph or 1, num_nodes, num_neighbors, num_features)
+        neighbors_feat = tf.gather(graph["vertex_feat"], graph["neighbors_idx"], batch_dims=1)
+        neighbors_feat = tf.reduce_sum(neighbors_feat, axis=2) # 聚合邻居节点特征，形状 (num_graph or 1, num_nodes, num_features)
 
-        valid_lens = graph["valid_lens"] # 形状 (num_nodes, )
-        mask = tf.sequence_mask(valid_lens, tf.shape(neighbors_feat)[1], dtype=tf.float32) # 生成掩码，形状 (num_nodes, num_neighbors)
-        mask = tf.expand_dims(mask, axis=-1) # 扩展维度，形状 (num_nodes, num_neighbors, 1)，便于和特征维度进行广播
+        valid_lens = graph["valid_lens"] # 形状 (num_graph or 1, num_nodes)
         valid_lens = tf.where(tf.equal(valid_lens, 0), tf.ones_like(valid_lens), valid_lens) # 避免除以 0
-        
-        # 乘以掩码，使得无效邻居节点特征为 0，并聚合邻居节点特征，形状 (num_nodes, num_features)
-        neighbors_feat = tf.reduce_sum(neighbors_feat * mask, axis=1) 
-        valid_lens = tf.where(tf.equal(valid_lens, 0), tf.ones_like(valid_lens), valid_lens) # 防止除以 0
-        neighbors_feat = neighbors_feat / tf.expand_dims(valid_lens, axis=-1) # 归一化，形状 (num_nodes, num_features)
+        # 转换为浮点数，并添加一个维度便于广播，形状 (num_graph or 1, num_nodes, 1)
+        valid_lens = tf.cast(tf.expand_dims(valid_lens,axis=-1), tf.float32) 
+        neighbors_feat = neighbors_feat / valid_lens # 归一化，形状 (num_graph or 1, num_nodes, num_features)
 
         # 信息传递，汇聚得到新的节点特征
         vertex_feat = self.W_dense(neighbors_feat,**kwargs) + self.B_dense(graph["vertex_feat"],**kwargs) # (num_nodes, num_hidddens)
@@ -442,8 +478,13 @@ class GATLayer(tf.keras.layers.Layer):
     def __init__(self, num_hiddens : int, num_heads : int, dropout : float, **kwargs):
         super(GATLayer, self).__init__(**kwargs)
         # 多头注意力层
+        # 注意多头注意力层的输入是 query, value 的形状
+        # query : (num_graph or 1, num_nodes, num_queries = 1,            num_hiddens)
+        # value : (num_graph or 1, num_nodes, num_kv = num_neighbors + 1, num_hiddens)
+        # 因此，注意力汇聚在 axis=2 上，即对邻居节点进行汇聚
         self.multi_head_attn = tf.keras.layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=num_hiddens//num_heads, dropout=dropout)
+            num_heads=num_heads, key_dim=num_hiddens//num_heads, 
+            dropout=dropout, attention_axes=(2,))
         self.attn_weights = None # 保存注意力权重
 
         # MLP 层做非线性变换
@@ -459,28 +500,38 @@ class GATLayer(tf.keras.layers.Layer):
         
         # 准备注意力层的输入
         # query 的形状应该为 (batch_size, num_queries, num_features)
-        # 这里我们把 batch_size 设为 num_nodes，num_query 设为 1 表示每个节点查询自身
-        query = graph["vertex_feat"][:, None, :] # (num_nodes, 1, num_features)
+        # 这里 batch_size = num_graph，对于全图任务 num_graph = 1，num_queries = num_nodes 表示每个图中的节点数量
+        query = graph["vertex_feat"] # (num_graph or 1, num_nodes, num_features)
 
         # key / value 的形状应该为 (batch_size, num_keys, num_features)
-        # 这里 batch_size = num_nodes，num_keys = num_neighbors 表示每个节点从邻居节点中计算注意力
-        value = tf.gather(graph["vertex_feat"], graph["neighbors_idx"]) # (num_nodes, num_neighbors, num_features)
-        num_neighbors = tf.shape(value)[1] # 邻居节点数
+        # 这里 batch_size = num_graph，num_keys = num_neighbors 表示图中每个节点从邻居节点获取和计算注意力
+        value = tf.gather(graph["vertex_feat"], graph["neighbors_idx"], batch_dims=1) # (num_graph, num_nodes, num_neighbors, num_features)
+        num_neighbors = tf.shape(value)[2] # 邻居节点数
 
         # 由于 GAT 的注意力查询时可以用到自身节点，所以把自身节点特征也加入 key / value
-        value = tf.concat([query, value], axis=1) # (num_nodes, num_neighbors + 1, num_features)
+        query = tf.expand_dims(query, axis=2) # 先扩展维度，(num_graph, num_nodes, 1, num_features)
+        value = tf.concat([query, value], axis=2) # (num_graph, num_nodes, num_neighbors + 1, num_features)
 
-        # 利用每个节点的有效邻居数，构造注意力掩码，形状为 (batch_size, num_queries, num_key_values)
-        # 在这里，mask 的形状为 (num_nodes, 1, num_neighbors + 1)
+        # 利用每个节点的有效邻居数，构造注意力掩码，形状为 (num_graph, num_nodes, num_queries, num_key_value)
+        # 在这里，mask 的形状为 (num_graph, num_nodes, num_neighbors + 1)
         valid_lens = graph["valid_lens"] + 1 # 加 1 表示注意力计算时包含自身节点
-        mask = tf.sequence_mask(valid_lens, maxlen=num_neighbors + 1, dtype=tf.float32)
-        mask = mask[:,None,:] # 添加维度变成 (num_nodes, 1, num_neighbors + 1)
+        mask = tf.sequence_mask(valid_lens, maxlen=num_neighbors + 1, dtype=tf.float32) # (num_graph, num_nodes, num_neighbors + 1)
+        mask = tf.expand_dims(mask, axis=2) # 添加维度变成 (num_graph, num_nodes, num_queries = 1, num_key_value)
 
-        # 计算注意力
+        # 计算注意力，注意此时 query 和 value 的形状
+        # query : (num_graph, num_nodes, num_queries = 1,            num_features)
+        # value : (num_graph, num_nodes, num_kv = num_neighbors + 1, num_features)
+        # 因此，注意力应该在 num_queries 和 num_kv 所在的维度上计算，因此 attention_axes=(2,)
+        # 注意输出 vertex_feat 和 attn_weights 的形状
+        # vertex_feat : (num_graph, num_nodes, 1, num_features)
+        # attn_weights : (num_graph, num_nodes, num_heads, 1, num_neighbors + 1)
         vertex_feat, attn_weights = self.multi_head_attn(
             query, value, value, attention_mask=mask, return_attention_scores=True, **kwargs)
-        vertex_feat = tf.squeeze(vertex_feat) # (num_nodes, 1, num_features) -> (num_nodes, num_features)
-        self.attn_weights = tf.squeeze(attn_weights) # (num_nodes, num_heads, num_neighbors + 1)
+
+        # 去掉多余的维度，变换注意力权重的形状
+        vertex_feat = tf.squeeze(vertex_feat, axis=2) # (num_graph, num_nodes, num_features)
+        self.attn_weights = tf.squeeze(attn_weights, axis=3) # (num_graph, num_nodes, num_heads, num_neighbors + 1)
+        self.attn_weights = tf.transpose(self.attn_weights, perm=[0,2,1,3]) # (num_graph, num_heads, num_nodes, num_neighbors + 1)
 
         # 做一层 MLP
         vertex_feat = self.mlp(vertex_feat, **kwargs)
@@ -509,7 +560,7 @@ class GCNModel(tf.keras.Model):
         # graph : 存储图信息的字典
         # 包含 vertex_feat, edges_feat, graph_feat, edges_idx, neighbors_idx, connections_idx, valid_lens
 
-        # 节点特征的嵌入，形状从 (num_nodes, vocab_size) 变为 (num_nodes, num_hidddens)
+        # 节点特征的嵌入，形状从 (num_graph or 1, num_nodes, vocab_size) 变为 (num_graph or 1, num_nodes, num_hidddens)
         graph["vertex_feat"] = tf.cast(graph["vertex_feat"], dtype=tf.float32)
         graph["vertex_feat"] = self.node_embed(graph["vertex_feat"], **kwargs) \
             / tf.reduce_sum(graph["vertex_feat"], axis=-1, keepdims=True) # 归一化，避免数值过大
@@ -522,112 +573,476 @@ class GCNModel(tf.keras.Model):
         node_probs = self.classifier(graph["vertex_feat"], **kwargs)
         return node_probs
 
-def build_leffingwell_molecules_graph(path, behavier_name : str="pungent"):
-    molecules = pd.read_csv(os.path.join(path,"molecules.csv"), index_col=0)
-    behavier = pd.read_csv(os.path.join(path,"behavier.csv"), index_col=0)
+def train_gnn_node_task(model, graph, node_labels, train_nodes, valid_nodes, epochs : int=10, lr : float=0.05, verbose : int=1):
+    # 创建优化器和损失函数
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    loss_func = tf.keras.losses.SparseCategoricalCrossentropy()
 
-    smiles = molecules['IsomericSMILES']
+    # 展示训练进度
+    animator = utils.Animator(xlabel="epoch", xlim=[1, epochs], fmts=(('-'), ('m--','g-.')),
+                              legend=[("train loss"), ("train acc", "valid acc")], figsize=(7,3), ncols=2)
+    
+    for epoch in range(epochs):
+        with tf.GradientTape() as tape:
+            node_probs = model(graph, training=True) # 形状 (num_graph or 1, num_nodes, num_classes)
+            # 只计算训练节点的损失
+            loss = loss_func(tf.gather(node_labels, train_nodes, batch_dims=1),
+                             tf.gather(node_probs, train_nodes, batch_dims=1))
+        weights = model.trainable_variables
+        grads = tape.gradient(loss, weights)
+        optimizer.apply_gradients(zip(grads, weights))
+
+        if epoch == 0 or (epoch + 1) % verbose == 0:
+            # 评估模型
+            train_acc = tf.keras.metrics.sparse_categorical_accuracy(
+                tf.gather(node_labels, train_nodes, batch_dims=1), tf.gather(node_probs, train_nodes, batch_dims=1))
+            valid_acc = tf.keras.metrics.sparse_categorical_accuracy(
+                tf.gather(node_labels, valid_nodes, batch_dims=1), tf.gather(node_probs, valid_nodes, batch_dims=1))
+            animator.add(epoch + 1, (loss.numpy(), ),ax=0)
+            animator.add(epoch + 1, (train_acc.numpy().mean(), valid_acc.numpy().mean()),ax=1)
+        
+    return model
+
+class GNBlockBase(tf.keras.layers.Layer):
+    def __init__(self, node_mp : bool=True, edge_mp : bool=True, global_mp : bool=True, **kwargs):
+        """
+        Parameters
+        ----------
+        node_mp : bool, default = `True`
+            是否开启节点消息传递
+        edge_mp : bool, default = `True`
+            是否开启边消息传递
+        global_mp : bool, default = `True`
+            是否开启全局消息传递
+        """
+        super(GNBlockBase, self).__init__(**kwargs)
+        # 是否开启消息传递 Message Passing
+        self.node_mp, self.edge_mp, self.global_mp = node_mp, edge_mp, global_mp
+    
+    # 边更新函数
+    @abstractmethod
+    def phi_edge(self, edges_feat : tf.Tensor=None, 
+                 vertex_feat_s : tf.Tensor=None, 
+                 vertex_feat_r : tf.Tensor=None, 
+                 global_feat : tf.Tensor=None, **kwargs):
+        raise NotImplementedError
+
+    # 节点更新函数
+    @abstractmethod
+    def phi_node(self, vertex_feat : tf.Tensor=None, 
+                 connected_edges_feat : tf.Tensor=None, 
+                 global_feat : tf.Tensor=None, **kwargs):
+        raise NotImplementedError
+    
+    # 全局更新函数
+    @abstractmethod
+    def phi_global(self, global_feat : tf.Tensor=None,
+                   agg_vertex_feat : tf.Tensor=None, 
+                   agg_edges_feat : tf.Tensor=None, **kwargs):
+        raise NotImplementedError
+    
+    # 边到节点的汇聚函数
+    @abstractmethod
+    def rho_edge_to_node(self, graph : dict, **kwargs):
+        raise NotImplementedError
+
+    # 边到全图特征的汇聚函数
+    @abstractmethod
+    def rho_edge_to_global(self, graph : dict, **kwargs):
+        raise NotImplementedError
+    
+    # 节点到全图特征的汇聚函数
+    @abstractmethod
+    def rho_node_to_global(self, graph : dict, **kwargs):
+        raise NotImplementedError
+
+    # GN Block 的前向推理逻辑
+    def call(self, graph, **kwargs):
+        """
+        graph 是包含图信息的字典，包含 `vertex_feat`, `edges_feat`, `edges_idx`, `neighbors_idx`
+        `connected_edges_idx`, `valid_lens`, `valid_nodes`, `valid_edges`, `global_feat`\n
+
+        每种图信息的第一个维度都是批量维度 `batch_size`，即图的数量 `num_graph = batch_size`\n
+        对于节点相关的信息，第二个维度是节点数量 `num_nodes`\n
+        对于边相关的信息，第二个维度是边数量 `num_edges`\n
+        """
+        
+        # STEP 1: 边特征更新，对应 phi_e
+        if self.node_mp:
+            vertex_feat_s = tf.gather(graph['vertex_feat'], graph['edges_idx'][:,:,0], batch_dims=1)
+            vertex_feat_r = tf.gather(graph['vertex_feat'], graph['edges_idx'][:,:,1], batch_dims=1)
+        else:
+            vertex_feat_s = vertex_feat_r = None
+        global_feat = graph['global_feat'] if self.global_mp else None
+        graph["edges_feat"] = self.phi_edge(graph["edges_feat"], vertex_feat_s, vertex_feat_r, global_feat)
+
+        # STEP 2: 汇聚边特征到节点，对应 rho_{E->V}
+        # 这里不定义汇聚逻辑，汇聚逻辑在 rho_edge_to_node 中定义
+        connected_edges_feat = self.rho_edge_to_node(graph) if self.edge_mp else None
+        
+        # STEP 3: 节点特征更新，对应 phi_v
+        global_feat = graph['global_feat'] if self.global_mp else None
+        graph["vertex_feat"] = self.phi_node(graph["vertex_feat"], connected_edges_feat, global_feat)
+
+        # STEP 4: 汇聚边特征到全图，对应 rho_{E->U}
+        agg_edges_feat = self.rho_edge_to_global(graph) if self.edge_mp else None
+        # STEP 5: 汇聚节点特征到全图，对应 rho_{V->U}
+        agg_vertex_feat = self.rho_node_to_global(graph) if self.node_mp else None
+
+        # STEP 6: 全图特征更新，对应 phi_u
+        graph["global_feat"] = self.phi_global(graph["global_feat"], agg_vertex_feat, agg_edges_feat)
+
+        return graph
+
+class GNBlock(GNBlockBase):
+    def __init__(self, edge_num_hiddens : int, node_num_hiddens : int, global_num_hiddens : int, dropout : float=0.25,
+                 node_mp: bool = True, edge_mp: bool = True, global_mp: bool = True, **kwargs):
+        super(GNBlock, self).__init__(node_mp, edge_mp, global_mp, **kwargs)
+        # 边特征更新的 MLP + LayerNorm
+        self.phi_edge_mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(edge_num_hiddens, activation="relu"),
+            tf.keras.layers.Dropout(dropout)
+        ])
+        self.phi_edge_ln = tf.keras.layers.LayerNormalization()
+        # 节点特征更新的 MLP + LayerNorm
+        self.phi_node_mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(node_num_hiddens, activation="relu"),
+            tf.keras.layers.Dropout(dropout)
+        ])
+        self.phi_node_ln = tf.keras.layers.LayerNormalization()
+        # 全图特征更新的 MLP + BatchNorm
+        self.phi_global_mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(global_num_hiddens, activation="relu"),
+            tf.keras.layers.Dropout(dropout)
+        ])
+        self.phi_global_bn = tf.keras.layers.BatchNormalization()
+    
+    def phi_edge(self, edges_feat : tf.Tensor=None,
+                 vertex_feat_s : tf.Tensor=None,
+                 vertex_feat_r : tf.Tensor=None,
+                 global_feat : tf.Tensor=None, **kwargs):
+        # edges_feat, vertex_feat_s, vertex_feat_r : (num_graph, num_edges, num_feat)
+        # global_feat : (num_graph, num_feat)
+        if edges_feat is None:
+            return None
+        
+        # 如果要使用 global_feat，需要先扩展维度
+        if global_feat is not None:
+            global_feat = tf.expand_dims(global_feat, axis=1) # (num_graph, 1, num_feat)
+            global_feat = tf.tile(global_feat, [1, tf.shape(edges_feat)[1], 1]) # (num_graph, num_edges, num_feat)
+        
+        # 组装输入特征，去掉 None 的特征
+        inputs = [edges_feat, vertex_feat_s, vertex_feat_r, global_feat]
+        inputs = [x for x in inputs if x is not None]
+        # 拼接输入特征
+        inputs = tf.concat(inputs, axis=-1)
+
+        # MLP 变换 + LayerNorm + 残差连接
+        mlp_output = self.phi_edge_mlp(inputs, **kwargs)
+        updated_edges_feat = self.phi_edge_ln(mlp_output + edges_feat, **kwargs)
+        return updated_edges_feat
+    
+    def phi_node(self, vertex_feat : tf.Tensor=None,
+                 connected_edges_feat : tf.Tensor=None,
+                 global_feat : tf.Tensor=None, **kwargs):
+        # vertex_feat, connected_edges_feat : (num_graph, num_nodes, num_feat)
+        # global_feat : (num_graph, num_feat)
+        if vertex_feat is None:
+            return None
+        
+        # 如果要使用 global_feat，需要先扩展维度
+        if global_feat is not None:
+            global_feat = tf.expand_dims(global_feat, axis=1) # (num_graph, 1, num_feat)
+            global_feat = tf.tile(global_feat, [1, tf.shape(vertex_feat)[1], 1]) # (num_graph, num_nodes, num_feat)
+        
+        # 组装输入特征，去掉 None 的特征
+        inputs = [vertex_feat, connected_edges_feat, global_feat]
+        inputs = [x for x in inputs if x is not None]
+        # 拼接输入特征
+        inputs = tf.concat(inputs, axis=-1)
+
+        # MLP 变换 + LayerNorm + 残差连接
+        mlp_output = self.phi_node_mlp(inputs, **kwargs)
+        updated_vertex_feat = self.phi_node_ln(mlp_output + vertex_feat, **kwargs)
+        return updated_vertex_feat
+    
+    def phi_global(self, global_feat : tf.Tensor=None,
+                   agg_vertex_feat : tf.Tensor=None,
+                   agg_edges_feat : tf.Tensor=None, **kwargs):
+        # global_feat, agg_vertex_feat, agg_edges_feat : (num_graph, num_feat)
+        if global_feat is None:
+            return None
+        
+        # 组装输入特征，去掉 None 的特征
+        inputs = [global_feat, agg_vertex_feat, agg_edges_feat]
+        inputs = [x for x in inputs if x is not None]
+        # 拼接输入特征
+        inputs = tf.concat(inputs, axis=-1)
+
+        # MLP 变换 + BatchNorm + 残差连接
+        mlp_output = self.phi_global_mlp(inputs, **kwargs)
+        updated_global_feat = self.phi_global_bn(mlp_output + global_feat, **kwargs)
+        return updated_global_feat
+    
+    def rho_edge_to_node(self, graph : dict, **kwargs):
+        # 没有边特征，不需要汇聚
+        if graph['edges_feat'] is None:
+            return None
+        # 获取连接的边特征，形状 : (num_graph, num_nodes, num_neighbors, num_feat)
+        connected_edges_feat = tf.gather(graph['edges_feat'], graph['connected_edges_idx'], batch_dims=1)
+        valid_lens = tf.cast(graph['valid_lens'], tf.float32) # (num_graph, num_nodes)
+        valid_lens = tf.where(tf.equal(valid_lens, 0), tf.ones_like(valid_lens), valid_lens) # 避免除以 0
+        
+        # 汇聚均值，形状 : (num_graph, num_nodes, num_feat)
+        # valid_lens 扩展一个维度，便于广播
+        connected_edges_feat = tf.reduce_sum(connected_edges_feat, axis=2) / tf.expand_dims(valid_lens, axis=-1)
+
+        return connected_edges_feat
+    
+    def rho_edge_to_global(self, graph : dict, **kwargs):
+        # 没有边特征，不需要汇聚
+        if graph['edges_feat'] is None:
+            return None
+        # 获取边特征，形状 : (num_graph, num_edges, num_feat)
+        edges_feat = graph['edges_feat']
+        # 有效边的数量，形状 : (num_graph, )
+        valid_edges = tf.cast(graph['valid_edges'], tf.float32)
+        valid_edges = tf.where(tf.equal(valid_edges, 0), tf.ones_like(valid_edges), valid_edges) # 避免除以 0
+
+        # 汇聚均值，形状 : (num_graph, num_feat)
+        # valid_edges 扩展一个维度，便于广播
+        agg_edges_feat = tf.reduce_sum(edges_feat, axis=1) / tf.expand_dims(valid_edges, axis=-1)
+
+        return agg_edges_feat
+
+    def rho_node_to_global(self, graph : dict, **kwargs):
+        # 没有节点特征，不需要汇聚
+        if graph['vertex_feat'] is None:
+            return None
+        # 获取节点特征，形状 : (num_graph, num_nodes, num_feat)
+        vertex_feat = graph['vertex_feat']
+        # 有效节点的数量，形状 : (num_graph, )
+        valid_nodes = tf.cast(graph['valid_nodes'], tf.float32)
+        valid_nodes = tf.where(tf.equal(valid_nodes, 0), tf.ones_like(valid_nodes), valid_nodes) # 避免除以 0
+
+        # 汇聚均值，形状 : (num_graph, num_feat)
+        # valid_nodes 扩展一个维度，便于广播
+        agg_vertex_feat = tf.reduce_sum(vertex_feat, axis=1) / tf.expand_dims(valid_nodes, axis=-1)
+
+        return agg_vertex_feat
+
+# 从 SMILE 字符串中解析出分子图
+def decode_smile_into_graph(smile : str):
+    from rdkit import Chem
 
     # 原子映射字典 和 化学键映射字典
     AtomMap = {"C": 0, "N": 1, "O": 2, "S": 3}
     BondMap = {"SINGLE": 0, "DOUBLE": 1, "TRIPLE": 2, "AROMATIC": 3}
 
-    max_num_nodes = 0 # 所有分子，最大的节点数
-    max_num_edges = 0 # 所有分子，最大的边数
     num_neighbors = 4 # 化学分子，每个节点最多有 4 个邻居
 
+    # 将 SMILES 字符串转换为分子对象
+    molecule = Chem.MolFromSmiles(smile)
+    graph = Chem.RWMol(molecule) # 拷贝分子对象，用于创建分子图
+
+    vertex = [] # 节点列表
+    vertex_feat = [] # 节点特征列表
+    edges = [] # 边列表
+
+    # 获取节点信息
+    for atom in graph.GetAtoms():
+        vertex.append(atom.GetIdx()) # 节点索引
+        # 原子名称作为节点特征，但映射为原子索引，便于后续 One-Hot 编码
+        vertex_feat.append([AtomMap[atom.GetSymbol()]]) 
+
+    # 获取边信息
+    for bond in graph.GetBonds():
+        # 边连接关系，原子之间连接的化学键类型作为边特征
+        # 化学键类型映射为化学键索引，便于后续 One-Hot 编码
+        edges.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), [BondMap[bond.GetBondType().name]]))
+    
+    # 创建图数据
+    _, edges_idx, neighbors_idx, connected_edges_idx, valid_lens \
+        = build_global_graph(vertex, edges, num_neighbors=num_neighbors, is_undirectional=True)
+
+    return graph, vertex_feat, edges_idx, neighbors_idx, connected_edges_idx, valid_lens
+
+def build_leffingwell_molecules_graph(path : str, behavier_name : str="pungent"):
+    molecules = pd.read_csv(os.path.join(path,"molecules.csv"), index_col=0)
+    behavier = pd.read_csv(os.path.join(path,"behavier.csv"), index_col=0)
+
+    smiles = molecules['IsomericSMILES']
+
     # 存储每个分子的图信息
-    graphs_info = {}
+    graphs, labels = [], []
 
     # 依次获得分子的 SMILES 字符串
     for cid, smile in smiles.items():
-        # 将 SMILES 字符串转换为分子对象
-        molecule = Chem.MolFromSmiles(smile)
-        graph = Chem.RWMol(molecule) # 拷贝分子对象，用于创建分子图
-
-        vertex = [] # 节点列表
-        vertex_feat = [] # 节点特征列表
-        edges = [] # 边列表
-
-        # 获取节点信息
-        for atom in graph.GetAtoms():
-            vertex.append(atom.GetIdx()) # 节点索引
-            # 原子名称作为节点特征，但映射为原子索引，便于后续 One-Hot 编码
-            vertex_feat.append(AtomMap[atom.GetSymbol()]) 
-
-        # 获取边信息
-        for bond in graph.GetBonds():
-            # 边连接关系，原子之间连接的化学键类型作为边特征
-            # 化学键类型映射为化学键索引，便于后续 One-Hot 编码
-            edges.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), BondMap[bond.GetBondType().name]))
+        # 将 SMILE 解析为分子图
+        graph, vertex_feat, edges_idx, neighbors_idx, \
+        connected_edges_idx, valid_lens = decode_smile_into_graph(smile)
         
-        # 更新最大节点数和最大边数
-        max_num_nodes = max(max_num_nodes, len(vertex))
-        max_num_edges = max(max_num_edges, len(edges))
-        
-        # 添加到分子图中
-        graphs_info[cid] = (graph, vertex, vertex_feat, edges)
-
-    # 填充节点特征和边特征，便于每个分子图的信息组装为张量
-    graphs = {
-        "edges_idx": [],
-        "vertex_feat": [],
-        "edges_feat": [],
-        "neighbors_idx": [],
-        "connected_edges_idx": [],
-        "valid_lens": [],
-        "valid_nodes": [],
-        "valid_edges": [],
-        "molecule_graph": {}
-    }
-    labels = [] # 分子标签
-
-    max_num_edges = max_num_edges * 2 # 无向图，边数翻倍
-
-    for cid, (graph, vertex, vertex_feat, edges) in graphs_info.items():
-        # 构建每个分子的图，对于分子而言，每个原子最多有 4 个邻居
-        _, edges_idx, neighbors_idx, connected_edges_idx, valid_lens \
-            = build_global_graph(vertex,edges,num_neighbors=4,is_undirectional=True)
         # 从 edges_idx 中解绑边连接关系和边特征
         edges_feat = [edge[-1] for edge in edges_idx]
         edges_idx = [(edge[0], edge[1]) for edge in edges_idx]
 
-        # 记录有效节点数和有效边数
-        graphs["valid_nodes"].append(len(vertex))
-        graphs["valid_edges"].append(len(edges))
-
-        # 填充节点特征和边特征
-        vertex_feat += [0 for _ in range(max_num_nodes - len(vertex_feat))]
-        edges_feat += [0 for _ in range(max_num_edges - len(edges_feat))]
-        edges_idx += [(-1, -1) for _ in range(max_num_edges - len(edges_idx))]
-        neighbors_idx += [[0] * num_neighbors for _ in range(max_num_nodes - len(neighbors_idx))]
-        connected_edges_idx += [[0] * num_neighbors for _ in range(max_num_nodes - len(connected_edges_idx))]
-        valid_lens += [0] * (max_num_nodes - len(valid_lens))
-
-        # 对节点特征和边特征进行 One-Hot 编码
-        vertex_feat = tf.one_hot(vertex_feat, depth=len(AtomMap))
-        edges_feat = tf.one_hot(edges_feat, depth=len(BondMap))
-
-        # 记录每个分子图的信息
-        graphs["edges_idx"].append(edges_idx)
-        graphs["vertex_feat"].append(vertex_feat)
-        graphs["edges_feat"].append(edges_feat)
-        graphs["neighbors_idx"].append(neighbors_idx)
-        graphs["connected_edges_idx"].append(connected_edges_idx)
-        graphs["valid_lens"].append(valid_lens)
-        graphs["molecule_graph"][cid] = graph
-
-        # 记录分子标签
-        labels.append(behavier.loc[cid,behavier_name])
-
-    # 将每个分子图的信息组装为张量
-    graphs["edges_idx"] = tf.stack(graphs["edges_idx"])
-    graphs["vertex_feat"] = tf.stack(graphs["vertex_feat"])
-    graphs["edges_feat"] = tf.stack(graphs["edges_feat"])
-    graphs["neighbors_idx"] = tf.stack(graphs["neighbors_idx"])
-    graphs["connected_edges_idx"] = tf.stack(graphs["connected_edges_idx"])
-    graphs["valid_lens"] = tf.stack(graphs["valid_lens"])
-    graphs["valid_nodes"] = tf.constant(graphs["valid_nodes"])
-    graphs["valid_edges"] = tf.constant(graphs["valid_edges"])
-
+        # 组装分子图信息
+        graph_info = {
+            "cid": cid,
+            "graph": graph,
+            "vertex_feat": vertex_feat,
+            "edges_idx": edges_idx,
+            "edges_feat": edges_feat,
+            "neighbors_idx": neighbors_idx,
+            "connected_edges_idx": connected_edges_idx,
+            "valid_lens": valid_lens
+        }
+        
+        # 添加到分子图列表
+        graphs.append(graph_info)
+        labels.append(behavier.loc[cid, behavier_name])
+    
     return graphs, labels
+
+def load_leffingwell_molecules_data(path : str, behavier_name : str="pungent", test_size : float=0.2, batch_size : int=64, seed : int=42):
+    # 读取分子图数据
+    graphs, labels = build_leffingwell_molecules_graph(path, behavier_name=behavier_name)
+
+    # 切分训练集和测试集
+    train_graphs, valid_graphs, train_labels, valid_labels = train_test_split(graphs, labels, test_size=test_size, random_state=seed)
+
+    # 创建 GraphDataLoader
+    removed_keys = ("graph", "cid")
+    train_graphs = GraphDataLoader(train_graphs, train_labels, batch_size, shuffle=False, removed_keys=removed_keys)
+    valid_graphs = GraphDataLoader(valid_graphs, valid_labels, batch_size, shuffle=False, removed_keys=removed_keys)
+
+    return train_graphs, valid_graphs
+
+class MoleculeClassifier(tf.keras.Model):
+    def __init__(self, num_hiddens : int, num_classes : int, num_layers : int=1, dropout : float=0.25,
+                 edge_mp : bool=True, node_mp : bool=True, global_mp : bool=True, **kwargs):
+        super(MoleculeClassifier, self).__init__(**kwargs)
+        # 结点特征和边特征的嵌入层
+        self.num_hiddens = num_hiddens
+        self.vertex_embed = tf.keras.layers.Embedding(input_dim=4, output_dim=num_hiddens)
+        self.edge_embed = tf.keras.layers.Embedding(input_dim=4, output_dim=num_hiddens)
+
+        # GN Block 层
+        self.gn_blocks = [
+            GNBlock(edge_num_hiddens=num_hiddens,node_num_hiddens=num_hiddens,
+                    global_num_hiddens=num_hiddens,dropout=dropout,
+                    node_mp=node_mp,edge_mp=edge_mp,global_mp=global_mp) for _ in range(num_layers)]
+        
+        # 下游任务分类器
+        activate = "sigmoid" if num_classes == 1 else "softmax"
+        self.classifier = tf.keras.models.Sequential([
+            tf.keras.layers.Dropout(dropout),
+            tf.keras.layers.Dense(num_classes, activation=activate)
+        ])
+
+    def call(self, graph, **kwargs):
+        # 对节点特征和边特征进行嵌入，注意要去掉多余的维度
+        # (num_graph, num_nodes or num_edges, 1) -> (num_graph, num_nodes or num_edges, 1, num_hiddens)
+        # tf.squuze 去掉多余维度，(num_graph, num_nodes or num_edges, num_hiddens)
+        graph["vertex_feat"] = tf.squeeze(self.vertex_embed(graph["vertex_feat"]), axis=2)
+        graph["edges_feat"] = tf.squeeze(self.edge_embed(graph["edges_feat"]), axis=2)
+
+        # 用 valid_nodes, valide_edges 创建掩码，将无效节点特征和边特征置零
+        num_nodes, num_edges = graph["vertex_feat"].shape[1], graph["edges_feat"].shape[1]
+        mask_nodes = tf.sequence_mask(graph["valid_nodes"], maxlen=num_nodes, dtype=tf.float32) # (num_graph, num_nodes)
+        mask_edges = tf.sequence_mask(graph["valid_edges"], maxlen=num_edges, dtype=tf.float32) # (num_graph, num_edges)
+        # 扩展 mask 的维度，(num_graph, num_nodes or num_edges, 1)，便于广播
+        graph["vertex_feat"] = graph["vertex_feat"] * tf.expand_dims(mask_nodes, axis=-1)
+        graph["edges_feat"] = graph["edges_feat"] * tf.expand_dims(mask_edges, axis=-1)
+
+        # 初始化全图特征 global_feat，形状 (num_graph, num_hiddens)
+        graph["global_feat"] = tf.reduce_sum(graph["vertex_feat"], axis=1)
+        valid_nodes = tf.cast(graph["valid_nodes"], dtype=tf.float32) # (num_graph,)
+        graph["global_feat"] = graph["global_feat"] / tf.expand_dims(valid_nodes, axis=1) # 扩展维度，进行广播
+
+        # 多层 GN Block 提取图特征
+        for layer in self.gn_blocks:
+            graph = layer(graph, **kwargs)
+
+        # 下游任务分类器
+        embed_vec = graph["global_feat"] # 代表全图特征的嵌入向量，形状 (num_graph, num_hiddens)
+        probs = self.classifier(embed_vec, **kwargs) # (num_graph, num_classes)
+
+        return embed_vec, probs
+
+    # 模型的预测方法 predcit，实现从 GraphDataLoader 的批量预测
+    def predict(self, graph_iter : GraphDataLoader, **kwargs):
+        probs, embeds = [], []
+        for graph, _ in graph_iter.create_dataset(shuffle=False):
+            embed, prob = self(graph, training=False, **kwargs)
+            probs.append(prob)
+            embeds.append(embed)
+        # 将多个批量的预测结果拼接起来
+        return tf.concat(embeds, axis=0), tf.concat(probs, axis=0)
+
+def train_gnn_graph_task(model, train_graphs, valid_graphs, epochs : int=10, lr : float=0.05, verbose : int=1):
+    # 定义损失函数和优化器
+    from sklearn.metrics import roc_auc_score
+    loss_func = tf.keras.losses.SparseCategoricalCrossentropy()
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    # 展示训练过程
+    animator = utils.Animator(xlabel="epoch", xlim=[1, epochs], fmts=(('-'), ('m--','g-.')),
+                              legend=[("train loss"), ("train AUC", "valid AUC")], figsize=(7,3), ncols=2)
+
+    for epoch in range(epochs):
+        train_graphs.shuffle = True
+        for graph_batch, labels_batch in train_graphs.create_dataset(shuffle=True):
+            with tf.GradientTape() as tape:
+                _, probs = model(graph_batch, training=True)
+                loss = loss_func(labels_batch, probs)
+            weights = model.trainable_variables
+            grads = tape.gradient(loss, weights)
+            optimizer.apply_gradients(zip(grads, weights))
+        
+        if epoch == 0 or (epoch + 1) % verbose == 0:
+            # 评估模型，通过批量预测
+            _, train_probs = model.predict(train_graphs)
+            _, valid_probs = model.predict(valid_graphs)
+
+            # 计算损失和准确率
+            train_loss = loss_func(train_graphs.labels, train_probs).numpy()
+            train_auc = roc_auc_score(train_graphs.labels, train_probs.numpy()[:, 1])
+            valid_auc = roc_auc_score(valid_graphs.labels, valid_probs.numpy()[:, 1])
+            # 更新图像
+            animator.add(epoch + 1, (train_loss, ),ax=0)
+            animator.add(epoch + 1, (train_auc, valid_auc),ax=1)
+    
+    return model
+
+def visualize_embedding_tSNE(embeds, probs, labels, perplexity : int=10, figsize=(6, 5)):
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import MinMaxScaler
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # 进行降维并归一化
+    embeds_2d = TSNE(n_components=2, perplexity=perplexity).fit_transform(embeds)
+    embeds_2d = MinMaxScaler().fit_transform(embeds_2d)
+
+    # 可视化低维特征空间和决策情况
+    fig = plt.figure(figsize=figsize)
+    # 绘制内部颜色，创建 Normalize 对象实现自定义的颜色条
+    cmap = LinearSegmentedColormap.from_list(
+        "custom_cmap", [(0, "cadetblue"), (0.15, "grey"), (0.7, "salmon"), (1, "salmon")])
+
+    scatter1 = plt.scatter(embeds_2d[:,0], embeds_2d[:,1], vmax=1,
+                           c=probs, cmap=cmap, alpha=[0.6 if label == 1 else 0.1 for label in labels])
+    for label in [0, 1]:
+        idx = (labels == label) # 获取标签为 label 的索引
+        edgecolors = "red" if label == 1 else "black" # 设置边缘颜色
+        class_name = "pungent" if label == 1 else "non-pungent" # 设置类别名称
+        linewidth = 0.5 if label == 1 else 0.1 # 设置边缘宽度
+        # 绘制边缘颜色
+        plt.scatter(embeds_2d[idx, 0], embeds_2d[idx, 1], 
+                    c="none", edgecolors=edgecolors, linewidths=linewidth, label=class_name)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend(loc="upper left")
+    cbar = plt.colorbar(scatter1)
+
+    return embeds_2d
