@@ -1,7 +1,6 @@
 # DeepLearning-Tensorflow
 Basic knowledge of deep learning (based on Tensorflow implementation)
 
-
 ## Config
 In order to install and deploy the project code correctly, we need to configure the `source` folder of this project. The following are configuration schemes for different usage scenarios. 
 
